@@ -14,7 +14,7 @@ Your window into what your AI coding agents are doing, sitting in the terminal, 
 
 ## Features
 
-- **Session discovery** -- automatically finds Claude Code (`~/.claude/projects/`) and Codex (`~/.codex/sessions/`) sessions
+- **Session discovery** -- automatically finds Claude Code (`~/.claude/projects/`), Codex (`~/.codex/sessions/`), and OpenCode (`~/.local/share/opencode/opencode*.db`, honoring `XDG_DATA_HOME` and `OPENCODE_DB`) sessions
 - **Cost tracking** -- per-session spend with hourly and daily breakdowns; plan-aware billing (retail, Max, included)
 - **Context pressure** -- CTX% shows how full each agent's context window is
 - **Live toggle** -- filter to running sessions with real-time CPU%, cost rates, and incremental tool counts
@@ -42,7 +42,7 @@ agtop
 npm uninstall -g @ldegio/agtop
 ```
 
-Requires Node.js >= 18. No other dependencies.
+Requires Node.js >= 22.13 (for the built-in `node:sqlite` that reads OpenCode's database). No other dependencies.
 
 ## Options
 
@@ -111,4 +111,4 @@ Requires Node.js >= 18. No other dependencies.
 
 ## How It Works
 
-agtop reads JSONL transcript files written by Claude Code and Codex to extract token counts, tool invocations, and model information. It fetches current model pricing from LiteLLM (cached for 24 hours) to compute cost estimates. For running sessions, it uses `ps` and `lsof` to map OS processes back to sessions and collect CPU/memory metrics.
+agtop reads JSONL transcript files written by Claude Code and Codex to extract token counts, tool invocations, and model information. It fetches current model pricing from LiteLLM (cached for 24 hours) to compute cost estimates. OpenCode sessions are read from OpenCode's SQLite database (read-only), using the per-turn costs OpenCode recorded. A session counts as running until OpenCode marks it idle, and since one `opencode serve` runs every session, running sessions share that server's process tree for CPU/memory. Deleting one goes through `opencode session delete`. For running sessions, it uses `ps` and `lsof` to map OS processes back to sessions and collect CPU/memory metrics.

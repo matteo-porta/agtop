@@ -14,11 +14,12 @@
 // You should have received a copy of the GNU General Public License
 // along with this program; if not, see <https://www.gnu.org/licenses/>.
 /**
- * Estimate the token-based cost of local Codex and Claude Code sessions.
+ * Estimate the token-based cost of local Codex, Claude Code, and OpenCode sessions.
  *
  * The script reads recent session metadata from:
  * - ~/.codex/sessions
  * - ~/.claude/projects
+ * - ~/.local/share/opencode/opencode.db
  *
  * It presents a single combined session picker and computes an estimated cost
  * using built-in pricing tables for the detected models.
@@ -37,9 +38,10 @@ import {
   closeSync,
   rmSync,
 } from "node:fs";
-import { join, basename, dirname, sep } from "node:path";
+import { join, basename, dirname, sep, isAbsolute } from "node:path";
 import { homedir, cpus } from "node:os";
-import { spawn, execSync } from "node:child_process";
+import { spawn, execSync, execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -57,6 +59,11 @@ const CLAUDE_MAC_SESSIONS_ROOT = process.platform === "darwin"
 const CLAUDE_MAC_CODE_ROOT = process.platform === "darwin"
   ? join(HOME, "Library", "Application Support", "Claude", "claude-code-sessions")
   : null;
+// OpenCode keeps every session in one SQLite database under the XDG data dir
+// (on every platform, Windows and macOS included). Builds from a non-release
+// channel write opencode-<channel>.db next to it, and OPENCODE_DB overrides
+// the name or the whole path.
+const OPENCODE_DATA_DIR = join(process.env.XDG_DATA_HOME || join(HOME, ".local", "share"), "opencode");
 const UUID_RE = /([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/;
 const FULL_UUID_RE = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const SESSION_DATA_CACHE = new Map();
@@ -254,7 +261,7 @@ function parseCliArgs() {
     process.stdout.write(
       `agtop — an htop-like monitor for AI coding agent sessions
 
-Tracks Claude Code and Codex sessions running on your machine, showing
+Tracks Claude Code, Codex, and OpenCode sessions running on your machine, showing
 real-time cost estimation, token usage, tool invocations, and OS-level metrics.
 
 OPTIONS
@@ -1040,8 +1047,160 @@ function _scanMacSessionsRoot(root, forceSurface, sessions) {
   return sessions;
 }
 
+// ---------------------------------------------------------------------------
+// OpenCode sessions
+// ---------------------------------------------------------------------------
+
+// OpenCode 1.x keeps sessions in session/message/part; newer releases migrate
+// them into session_v2/session_message and leave the old tables frozen, so the
+// v2 tables win whenever they exist.
+// A fork starts as a copy of its source's history, original timestamps
+// included (and only v2 forks record fork_session_id), so rows older than
+// the session itself were already counted on the source.
+const OPENCODE_SQL = {
+  v1: {
+    sessions: "SELECT id, parent_id, directory, title, time_created, time_updated FROM session",
+    session: "SELECT title, directory, NULL AS agent, summary_additions, summary_deletions FROM session WHERE id = ?",
+    children: "SELECT id FROM session WHERE parent_id = ?",
+    turns: `SELECT m.time_created AS ts, json_extract(m.data, '$.modelID') AS model,
+      json_extract(m.data, '$.providerID') AS provider_id, json_extract(m.data, '$.cost') AS cost,
+      json_extract(m.data, '$.tokens') AS tokens, json_extract(m.data, '$.time.completed') AS completed
+      FROM message m JOIN session s ON s.id = m.session_id
+      WHERE m.session_id = ? AND m.time_created >= s.time_created AND json_extract(m.data, '$.role') = 'assistant'
+      ORDER BY m.time_created, m.id`,
+    tools: `SELECT coalesce(json_extract(p.data, '$.state.time.start'), p.time_created) AS ts,
+      json_extract(p.data, '$.tool') AS name, json_extract(p.data, '$.state.input') AS input, NULL AS calls
+      FROM part p JOIN session s ON s.id = p.session_id
+      WHERE p.session_id = ? AND p.time_created >= s.time_created AND json_extract(p.data, '$.type') = 'tool'
+      ORDER BY p.time_created, p.id`,
+  },
+  v2: {
+    sessions: "SELECT id, parent_id, directory, title, time_created, time_updated FROM session_v2",
+    // v2 closes every turn with an `idle` message, so any other newest message
+    // means the session is still working (or a crash left it unfinished).
+    busy: `SELECT s.id FROM session_v2 s WHERE s.parent_id IS NULL AND s.time_updated > ?
+      AND (SELECT m.type FROM session_message m WHERE m.session_id = s.id ORDER BY m.seq DESC LIMIT 1) != 'idle'`,
+    session: "SELECT title, directory, agent, summary_additions, summary_deletions FROM session_v2 WHERE id = ?",
+    children: "SELECT id FROM session_v2 WHERE parent_id = ?",
+    // Compaction is its own message type in v2 and bills its own model call.
+    turns: `SELECT m.time_created AS ts, json_extract(m.data, '$.model.id') AS model,
+      json_extract(m.data, '$.model.providerID') AS provider_id, json_extract(m.data, '$.cost') AS cost,
+      json_extract(m.data, '$.tokens') AS tokens, json_extract(m.data, '$.time.completed') AS completed
+      FROM session_message m JOIN session_v2 s ON s.id = m.session_id
+      WHERE m.session_id = ? AND m.time_created >= s.time_created AND m.type IN ('assistant', 'compaction')
+      ORDER BY m.seq`,
+    tools: `SELECT coalesce(json_extract(c.value, '$.time.created'), m.time_created) AS ts,
+      json_extract(c.value, '$.name') AS name, json_extract(c.value, '$.state.input') AS input,
+      json_extract(c.value, '$.state.metadata.toolCalls') AS calls
+      FROM session_message m JOIN session_v2 s ON s.id = m.session_id, json_each(m.data, '$.content') c
+      WHERE m.session_id = ? AND m.time_created >= s.time_created AND m.type = 'assistant'
+        AND json_extract(c.value, '$.type') = 'tool'
+      ORDER BY m.seq, c.key`,
+  },
+};
+
+const _opencodeDbs = new Map(); // database path -> { db, q: prepared OPENCODE_SQL statements }
+// data_file -> newest time_updated across the session and its descendants:
+// a running subagent updates only its own row, never the parent's.
+const _opencodeVersions = new Map();
+
+function loadNodeSqlite() {
+  // node:sqlite warns that it is experimental on every load; on stderr that
+  // lands in the middle of the TUI.
+  const emitWarning = process.emitWarning;
+  process.emitWarning = (warning, ...rest) => {
+    if (!/SQLite/.test(String(warning && warning.message || warning))) emitWarning.call(process, warning, ...rest);
+  };
+  try {
+    return createRequire(import.meta.url)("node:sqlite");
+  } finally {
+    process.emitWarning = emitWarning;
+  }
+}
+
+function opencodeDbPaths() {
+  const override = process.env.OPENCODE_DB;
+  if (override === ":memory:") return [];
+  if (override) return [isAbsolute(override) ? override : join(OPENCODE_DATA_DIR, override)];
+  // opencode-next.db is a pre-release v2 database OpenCode imports into opencode.db.
+  return listDir(OPENCODE_DATA_DIR)
+    .filter(f => /^opencode(-[A-Za-z0-9._-]+)?\.db$/.test(f) && f !== "opencode-next.db")
+    .map(f => join(OPENCODE_DATA_DIR, f));
+}
+
+function openOpencodeDb(path) {
+  if (_opencodeDbs.has(path)) return _opencodeDbs.get(path);
+  const { DatabaseSync } = loadNodeSqlite();
+  const db = new DatabaseSync(path, { readOnly: true });
+  const tables = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(r => r.name));
+  const sql = ["session_v2", "session_message"].every(t => tables.has(t)) ? OPENCODE_SQL.v2
+    : ["session", "message", "part"].every(t => tables.has(t)) ? OPENCODE_SQL.v1
+    : null;
+  // Not (or not yet) an OpenCode database: not cached, so a database
+  // OpenCode is still creating gets picked up on a later tick.
+  if (!sql) {
+    db.close();
+    return null;
+  }
+  const q = {};
+  for (const [name, text] of Object.entries(sql)) q[name] = db.prepare(text);
+  _opencodeDbs.set(path, { db, q });
+  return _opencodeDbs.get(path);
+}
+
+function opencodeDataFile(dbPath, sessionId) {
+  return `${dbPath}#${sessionId}`;
+}
+
+// Directories are stored with forward slashes, Windows drive paths included.
+function opencodeDirectory(dir) {
+  return process.platform === "win32" && (/^[A-Za-z]:\//.test(dir) || dir.startsWith("//")) ? dir.replaceAll("/", "\\") : dir;
+}
+
+function listOpencodeSessions() {
+  _opencodeVersions.clear();
+  const sessions = [];
+  for (const dbPath of opencodeDbPaths().filter(p => existsSync(p))) {
+    const oc = openOpencodeDb(dbPath);
+    if (!oc) continue;
+    const { q } = oc;
+    const rows = q.sessions.all();
+    // Bounded to recent sessions only to keep the per-tick query cheap.
+    const busy = q.busy && new Set(q.busy.all(Date.now() - 86400_000).map(r => r.id));
+    const byId = new Map(rows.map(r => [r.id, r]));
+    const childrenOf = new Map();
+    for (const r of rows) {
+      if (!r.parent_id || !byId.has(r.parent_id)) continue;
+      const list = childrenOf.get(r.parent_id);
+      if (list) list.push(r);
+      else childrenOf.set(r.parent_id, [r]);
+    }
+    const version = (r) => {
+      let v = r.time_updated;
+      for (const c of childrenOf.get(r.id) || []) v = Math.max(v, version(c));
+      _opencodeVersions.set(opencodeDataFile(dbPath, r.id), v);
+      return v;
+    };
+    for (const r of rows) {
+      if (r.parent_id && byId.has(r.parent_id)) continue;
+      sessions.push({
+        provider: "opencode",
+        session_id: r.id,
+        started_at: new Date(r.time_created).toISOString(),
+        last_active: new Date(version(r)).toISOString(),
+        model: null,
+        label_source: opencodeDirectory(r.directory),
+        data_file: opencodeDataFile(dbPath, r.id),
+        title: r.title || null,
+        _busy: busy ? busy.has(r.id) : null,
+      });
+    }
+  }
+  return sessions;
+}
+
 function listAllSessions() {
-  return [listCodexSessions(), listClaudeSessions()];
+  return [listCodexSessions(), listClaudeSessions(), listOpencodeSessions()];
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,6 +1229,17 @@ function resolveProviderPlans(plan) {
   if (plan === "max") return ["retail", "max"];
   if (plan === "included") return ["included", "included"];
   throw new SessionCostError(`Unsupported plan mode: ${plan}`);
+}
+
+// OpenCode costs are what OpenCode itself recorded, so no plan applies.
+function sessionPlan(session, codexPlan, claudePlan) {
+  if (session.provider === "opencode") return "retail";
+  return session.provider === "codex" ? codexPlan : claudePlan;
+}
+
+function sessionAccount(session) {
+  if (session.provider === "opencode") return null;
+  return session.provider === "claude" ? readClaudeAccount() : readCodexAccount();
 }
 
 // Fallback only: older Codex session files can lack a recorded cwd. Never
@@ -1524,12 +1694,97 @@ function extractCodexConfig(session) {
   return sections;
 }
 
+function opencodeConfigDirs(cwd) {
+  const dirs = [[join(process.env.XDG_CONFIG_HOME || join(HOME, ".config"), "opencode"), "~/.config/opencode"]];
+  if (process.env.OPENCODE_CONFIG_DIR) dirs.push([process.env.OPENCODE_CONFIG_DIR, "$OPENCODE_CONFIG_DIR"]);
+  if (cwd) dirs.push([join(cwd, ".opencode"), ".opencode"]);
+  return dirs;
+}
+
+function opencodeConfigFiles(cwd) {
+  const files = [];
+  for (const [dir, label] of [...opencodeConfigDirs(cwd), ...(cwd ? [[cwd, "."]] : [])]) {
+    for (const name of ["opencode.json", "opencode.jsonc"]) {
+      if (existsSync(join(dir, name))) files.push([join(dir, name), `${label}/${name}`]);
+    }
+  }
+  if (process.env.OPENCODE_CONFIG) files.push([process.env.OPENCODE_CONFIG, "$OPENCODE_CONFIG"]);
+  return files;
+}
+
+function opencodeMcpServers(configPath) {
+  try {
+    // JSONC: drop whole-line comments and trailing commas; anything fancier is skipped.
+    const text = (safeReadFile(configPath, 1 << 20) || "").replace(/^\s*\/\/.*$/gm, "").replace(/,(\s*[}\]])/g, "$1");
+    return Object.keys(JSON.parse(text).mcp || {});
+  } catch {
+    return []; // not parseable as plain JSON
+  }
+}
+
+/** Extract config info for an OpenCode session. */
+function extractOpencodeConfig(session) {
+  const sections = [];
+  const cwd = session.label_source || "";
+  const dirs = opencodeConfigDirs(cwd);
+  const globalDir = dirs[0][0];
+
+  const instrLines = [];
+  for (const [dir, label] of dirs) {
+    const block = formatConfigFile(join(dir, "AGENTS.md"), `${label}/AGENTS.md`);
+    if (block) instrLines.push(...block);
+  }
+  if (cwd) {
+    const block = formatConfigFile(join(cwd, "AGENTS.md"), "AGENTS.md");
+    if (block) instrLines.push(...block);
+  }
+  if (instrLines.length === 0) instrLines.push(notFoundLine("No AGENTS.md found"));
+  sections.push({ label: "Instructions", lines: instrLines, copyPath: cwd ? join(cwd, "AGENTS.md") : join(globalDir, "AGENTS.md") });
+
+  const configFiles = opencodeConfigFiles(cwd);
+  const configLines = [];
+  const mcpLines = [];
+  for (const [path, label] of configFiles) {
+    const block = formatConfigFile(path, label, 30);
+    if (block) configLines.push(...block);
+    for (const name of opencodeMcpServers(path)) mcpLines.push(`\x1b[38;5;180m${name}\x1b[0m`);
+  }
+  if (configLines.length === 0) configLines.push(notFoundLine("No opencode.json found"));
+  sections.push({ label: "Config", lines: configLines, copyPath: configFiles.length ? configFiles[0][0] : join(globalDir, "opencode.json") });
+
+  const skillLines = [];
+  for (const [dir] of dirs) {
+    for (const sub of ["skill", "skills"]) {
+      const skillsDir = join(dir, sub);
+      if (!dirExists(skillsDir)) continue;
+      for (const d of listDir(skillsDir)) {
+        const skillMd = safeReadFile(join(skillsDir, d, "SKILL.md"), 4096);
+        if (!skillMd) continue;
+        const nameMatch = skillMd.match(/name:\s*(.+)/i);
+        const descMatch = skillMd.match(/description:\s*(.+)/i);
+        const name = nameMatch ? nameMatch[1].trim() : d;
+        const desc = descMatch ? descMatch[1].trim() : "";
+        skillLines.push(`\x1b[38;5;114m${name}\x1b[0m` + (desc ? `  \x1b[38;5;245m${desc}\x1b[0m` : ""));
+      }
+    }
+  }
+  if (skillLines.length === 0) skillLines.push(notFoundLine("No skills installed (~/.config/opencode/skill/)"));
+  sections.push({ label: "Skills", lines: skillLines, copyPath: join(globalDir, "skill") });
+
+  if (mcpLines.length === 0) mcpLines.push(notFoundLine("No MCP servers in opencode.json"));
+  sections.push({ label: "MCP", lines: mcpLines, copyPath: configFiles.length ? configFiles[0][0] : join(globalDir, "opencode.json") });
+
+  return sections;
+}
+
 /** Get config sections for a session (cached on session object). */
 function getSessionConfig(session) {
   if (!session) return [];
   if (session._configSections) return session._configSections;
   session._configSections = session.provider === "claude"
     ? extractClaudeConfig(session)
+    : session.provider === "opencode"
+    ? extractOpencodeConfig(session)
     : extractCodexConfig(session);
   return session._configSections;
 }
@@ -2189,6 +2444,166 @@ async function extractClaudeSessionData(transcriptPath) {
   };
 }
 
+function contextWindowFor(model, used) {
+  const entry = findLitellmEntry(model, _litellmPricing);
+  if (entry && entry.max_input_tokens) return entry.max_input_tokens;
+  return used > 200000 ? 1_048_576 : 200000;
+}
+
+// Costs are the ones OpenCode recorded per turn, not tokens x LiteLLM: it
+// prices every provider it talks to (Bedrock, Copilot, ...), including the
+// ones LiteLLM names differently or that bill nothing.
+async function extractOpencodeSessionData(dataFile) {
+  const hash = dataFile.lastIndexOf("#");
+  const dbPath = dataFile.slice(0, hash), sessionId = dataFile.slice(hash + 1);
+  const { q } = openOpencodeDb(dbPath);
+  const tokenTotals = { input: 0, cache_read: 0, cache_write: 0, output: 0 };
+  const byModel = {}; // model -> { tokens: {input, cache_read, cache_write, output}, cost }
+  const costsByDay = {};
+  const costsByHour = {};
+  const usageByHour = {};
+  const activeMinutes = new Set();
+  const metrics = emptyMetrics();
+  const seenUrls = new Set();
+  const seenQueries = new Set();
+  let totalCost = 0;
+  let lastMainModel = null;
+  let vendor = null;
+
+  function scanOwn(id, isMain) {
+    const stats = { cost: 0, tool_count: 0, first_ts: 0, last_ts: 0, last_model: null, last_used: 0 };
+    for (const t of q.turns.all(id)) {
+      const tok = JSON.parse(t.tokens || "{}");
+      const cache = tok.cache || {};
+      const inp = tok.input || 0, cacheR = cache.read || 0, cacheW = cache.write || 0;
+      const out = (tok.output || 0) + (tok.reasoning || 0);
+      const cost = Number(t.cost) || 0;
+      if (!inp && !cacheR && !cacheW && !out && !cost) continue;
+      const model = t.model || "unknown";
+      tokenTotals.input += inp; tokenTotals.cache_read += cacheR; tokenTotals.cache_write += cacheW; tokenTotals.output += out;
+      const mb = (byModel[model] ||= { tokens: { input: 0, cache_read: 0, cache_write: 0, output: 0 }, cost: 0 });
+      mb.tokens.input += inp; mb.tokens.cache_read += cacheR; mb.tokens.cache_write += cacheW; mb.tokens.output += out;
+      mb.cost += cost;
+      totalCost += cost;
+      const d = new Date(t.ts);
+      const dayKey = localDateKey(d), hourKey = localHourKey(d);
+      (costsByDay[dayKey] ||= {})[model] = (costsByDay[dayKey][model] || 0) + cost;
+      (costsByHour[hourKey] ||= {})[model] = (costsByHour[hourKey][model] || 0) + cost;
+      addUsageSample(usageByHour, activeMinutes, d, model, inp, cacheR, cacheW, out, cost);
+      if (t.completed > t.ts) metrics.api_duration_ms += t.completed - t.ts;
+      stats.cost += cost;
+      stats.last_model = model;
+      stats.last_used = inp + cacheR + cacheW;
+      if (!stats.first_ts) stats.first_ts = t.ts;
+      stats.last_ts = Math.max(stats.last_ts, t.completed || t.ts);
+      if (isMain) { lastMainModel = model; vendor = t.provider_id || vendor; }
+    }
+    for (const x of q.tools.all(id)) {
+      const name = x.name || "unknown";
+      let input = {};
+      try { input = JSON.parse(x.input || "{}") || {}; } catch { /* truncated input */ }
+      metrics.tools[name] = (metrics.tools[name] || 0) + 1;
+      metrics.tool_count++;
+      stats.tool_count++;
+      const detail = extractToolDetail(name, input);
+      const entry = { d: detail.short || "(no args)", ts: new Date(x.ts).toISOString() };
+      if (detail.full && detail.full !== detail.short) entry.full = detail.full;
+      const list = (metrics.tool_details[name] ||= []);
+      list.push(entry);
+      if (list.length > MAX_TOOL_DETAILS) metrics.tool_details[name] = list.slice(-MAX_TOOL_DETAILS);
+      if (name === "webfetch" && input.url && seenUrls.size < 50 && !seenUrls.has(input.url)) {
+        seenUrls.add(input.url);
+        metrics.web_fetches.push(input.url);
+        metrics.web_fetch_count++;
+      } else if (name === "websearch" && input.query && seenQueries.size < 50 && !seenQueries.has(input.query)) {
+        seenQueries.add(input.query);
+        metrics.web_searches.push(input.query);
+        metrics.web_search_count++;
+      } else if (name === "skill" && (input.name || input.id)) {
+        const skill = input.name || input.id;
+        metrics.skills[skill] = (metrics.skills[skill] || 0) + 1;
+        metrics.skill_count++;
+      }
+      // MCP tools are "<server>_<tool>" when called directly, "<server>.<tool>"
+      // inside a code-mode `execute` call.
+      const mcpCalls = mcpPrefixes.some(p => name.startsWith(p)) ? [name]
+        : JSON.parse(x.calls || "[]").map(c => c.tool).filter(t => typeof t === "string" && t.includes("."));
+      for (const mcpName of mcpCalls) {
+        metrics.mcp_tool_count++;
+        if (!metrics.mcp_tools.includes(mcpName)) metrics.mcp_tools.push(mcpName);
+      }
+    }
+    return stats;
+  }
+
+  function scanTree(id) {
+    const stats = scanOwn(id, false);
+    for (const c of q.children.all(id)) {
+      const cs = scanTree(c.id);
+      stats.cost += cs.cost;
+      stats.tool_count += cs.tool_count;
+      if (cs.first_ts && (!stats.first_ts || cs.first_ts < stats.first_ts)) stats.first_ts = cs.first_ts;
+      stats.last_ts = Math.max(stats.last_ts, cs.last_ts);
+    }
+    return stats;
+  }
+
+  const row = q.session.get(sessionId);
+  if (!row) throw new SessionCostError(`OpenCode session ${sessionId} no longer exists`);
+  const mcpPrefixes = opencodeConfigFiles(opencodeDirectory(row.directory))
+    .flatMap(([path]) => opencodeMcpServers(path))
+    .map(server => server.replace(/[^a-zA-Z0-9_-]/g, "_") + "_");
+  const main = scanOwn(sessionId, true);
+  metrics.lines_added = row.summary_additions || 0;
+  metrics.lines_removed = row.summary_deletions || 0;
+
+  const subagents = [];
+  const nowMs = Date.now();
+  for (const c of q.children.all(sessionId)) {
+    const child = q.session.get(c.id);
+    const cs = scanTree(c.id);
+    // OpenCode 1.x has no agent column; it appends "(@<agent> subagent)" to the title instead.
+    const titleMatch = /^(.*?)\s*\(@(\S+) subagent\)$/.exec(child.title || "");
+    subagents.push({
+      agent_id: c.id,
+      type: child.agent || (titleMatch && titleMatch[2]) || "?",
+      description: titleMatch ? titleMatch[1] : child.title || "",
+      model: cs.last_model || "?",
+      started_at: cs.first_ts ? new Date(cs.first_ts).toISOString() : null,
+      last_active: cs.last_ts ? new Date(cs.last_ts).toISOString() : null,
+      duration_ms: cs.first_ts && cs.last_ts ? Math.max(0, cs.last_ts - cs.first_ts) : 0,
+      status: nowMs - (_opencodeVersions.get(opencodeDataFile(dbPath, c.id)) || cs.last_ts) < 30000 ? "running" : "done",
+      cost: cs.cost,
+      tool_count: cs.tool_count,
+      tool_use_id: null,
+      context: cs.last_used > 0 ? { used: cs.last_used, max: contextWindowFor(cs.last_model, cs.last_used) } : null,
+      ghost: false,
+    });
+  }
+
+  finalizeActiveMinutes(usageByHour, activeMinutes);
+  const models = Object.keys(byModel).sort();
+  return {
+    provider: "opencode",
+    title: row.title || null,
+    lastModel: lastMainModel,
+    models,
+    modelBreakdown: models.map(model => ({ model, tokens: byModel[model].tokens, total: money(byModel[model].cost) })),
+    tokens: { ...tokenTotals, total: tokenTotals.input + tokenTotals.cache_read + tokenTotals.cache_write + tokenTotals.output },
+    costs: { total: money(totalCost) },
+    costsByDay,
+    costsByHour,
+    usageByHour,
+    metrics,
+    subagents,
+    vendor,
+    context: main.last_used > 0 ? { used: main.last_used, model: main.last_model } : null,
+    _localDates: true,
+    _usageByHour: true,
+    _opencodeCacheV2: true,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Disk-based cost cache
 // ---------------------------------------------------------------------------
@@ -2247,6 +2662,7 @@ function saveUiPrefs(prefs) {
 }
 
 function diskCacheKey(filePath, childFiles) {
+  if (_opencodeVersions.has(filePath)) return `${filePath}|${_opencodeVersions.get(filePath)}`;
   try {
     const st = statSync(filePath);
     // Codex child threads (separate files folded into this session) also invalidate.
@@ -2398,7 +2814,9 @@ async function safeExtractSessionData(session) {
   // Check max mtime across ALL related files (Claude: main + subagent files;
   // Codex: main + child-thread files like an auto-review sub-thread) so the
   // cache invalidates when any of them are active, not just the main file.
-  const effectiveMtime = session.provider === "claude"
+  const effectiveMtime = session.provider === "opencode"
+    ? _opencodeVersions.get(session.data_file) || 0
+    : session.provider === "claude"
     ? claudeTranscriptFiles(session.data_file).reduce(
         (mx, f) => Math.max(mx, fileMtimeMs(f)), 0)
     : (session._childFiles || []).reduce(
@@ -2450,11 +2868,13 @@ async function safeExtractSessionData(session) {
   const pricingRefreshed = cache[dKey] && cache[dKey]._pricingRefresh2026_09 === true;
   const hasUsageByHour = cache[dKey] && cache[dKey]._usageByHour === true;
   const commonValid = dKey && cache[dKey] && detailsValid && hasLinesFields && hasCostsByDay && hasLocalDates && hasUsageByHour;
-  // Claude and Codex results have different shapes; each has its own format flags.
+  // Claude, Codex, and OpenCode results have different shapes; each has its own format flags.
   // (Codex used to share the Claude-only checks, so it could never hit the cache
   // and every Codex session was re-parsed on every startup.)
   const providerValid = session.provider === "codex"
     ? cache[dKey] && cache[dKey]._codexCacheV1 === true
+    : session.provider === "opencode"
+    ? cache[dKey] && cache[dKey]._opencodeCacheV2 === true
     : hasModelBreakdown && hasNoSubagentModel && hasSubagentsField && hasGhostSubagents && subagentCostNumber && subagentDescPairing && subagentContext && prettyMcpDetails && pricingRefreshed;
   if (commonValid && providerValid) {
     SESSION_DATA_CACHE.set(memKey, cache[dKey]);
@@ -2469,6 +2889,8 @@ async function safeExtractSessionData(session) {
       data = await extractCodexSessionData(session.data_file, session._childFiles);
     } else if (session.provider === "claude") {
       data = await extractClaudeSessionData(session.data_file);
+    } else if (session.provider === "opencode") {
+      data = await extractOpencodeSessionData(session.data_file);
     }
     const t1 = Date.now();
     _parseCost.set(memKey, { ms: t1 - t0, at: t1 });
@@ -2498,12 +2920,14 @@ async function annotateListCosts(sessions, plan) {
           (t.cached_input || 0) +
           (t.cache_read || 0) +
           (t.cache_write_5m || 0) +
-          (t.cache_write_1h || 0);
+          (t.cache_write_1h || 0) +
+          (t.cache_write || 0);
         session.list_output_tokens = t.output || 0;
         const m = safeMetrics(data);
         session.list_tool_count = m.tool_count;
         // Update displayed model from full extraction (lastModel excludes subagent sidechain files)
         if (data.lastModel) session.model = data.lastModel;
+        if (data.vendor) session.vendor = data.vendor;
         session.costs_by_day  = data.costsByDay  || null;
         session.costs_by_hour = data.costsByHour || null;
         session.usage_by_hour = data.usageByHour || null;
@@ -2573,6 +2997,15 @@ function readFileTail(filePath, bytes) {
  */
 function extractLastToolName(session) {
   if (!session || !session.data_file) return "";
+  if (session.provider === "opencode") {
+    const m = safeMetrics(SESSION_DATA_CACHE.get(`opencode:${session.data_file}`));
+    let last = "", lastTs = "";
+    for (const [name, details] of Object.entries(m.tool_details)) {
+      const ts = details.length ? details[details.length - 1].ts : "";
+      if (ts > lastTs) { last = name; lastTs = ts; }
+    }
+    return last;
+  }
   try {
     // For Claude, check all transcript files (main + subagent), use the one with latest mtime
     let targetFile = session.data_file;
@@ -2632,6 +3065,13 @@ function extractLastToolName(session) {
  */
 function extractContextUsage(session) {
   if (!session || !session.data_file) return null;
+  if (session.provider === "opencode") {
+    const data = SESSION_DATA_CACHE.get(`opencode:${session.data_file}`);
+    if (!data || !data.context) return null;
+    const { used, model } = data.context;
+    const max = contextWindowFor(model, used);
+    return { used, max, percent: Math.round((used / max) * 100) };
+  }
   try {
     // Context usage is per-conversation; the parent session's CTX% must come
     // from the parent's own jsonl. The previous logic picked whichever
@@ -3255,7 +3695,7 @@ const COL_TOOLS_RATE = {
 const COL_MODEL = {
   key: "model", label: "MODEL", width: 14, align: "left", desc: "AI model used by the session",
   render: (s) => {
-    const m = (s.model || "").replace(/^claude-/, "").replace(/^gpt-/, "");
+    const m = baseModelName(s.model || "").replace(/^claude-/, "").replace(/^gpt-/, "");
     if (!_showModelGlyphs) return m;
     if (s.surface === "desktop-cowork") return "☁ " + m;
     if (isDesktopSession(s)) return "⌘ " + m;
@@ -3695,6 +4135,13 @@ function isDesktopSession(session) {
 // like ~/.claude/projects/... — require start-of-string or "/" before, whitespace
 // or end-of-string after, so ".claude/" in a path does NOT match.
 const DAEMON_RE = /\b(app-server|server|daemon)\b/;
+// argv0 is the opencode binary (opencode.exe on every platform for the npm
+// build), or node running an opencode script.
+const OPENCODE_PROC_RE = /^(?:\S*[/\\])?(?:opencode(?:\.exe)?|node(?:\.exe)?\s+\S*[/\\]opencode(?:\.js)?)(?=\s|$)/i;
+// One `opencode serve` runs every session's model calls and tools, so its
+// process tree is reported once, under this key, and shared by the running
+// OpenCode sessions.
+const OPENCODE_PROCESS_KEY = "opencode:_server";
 
 // lsof-based fallback: find session UUID by checking open files.
 let _lsofCache = new Map(); // pid → { uuid, cwd, ts }
@@ -4099,6 +4546,17 @@ async function collectProcessMetrics(sessions) {
   for (const [key, rootPid] of rootPids) {
     sessionPids.set(key, bfsDescendants(rootPid, childrenByPpid));
   }
+  const opencodePids = new Set([...snapshot].filter(([, info]) => OPENCODE_PROC_RE.test(info.args || "")).map(([pid]) => pid));
+  const opencodeRoots = [...opencodePids].filter((pid) => {
+    for (let p = snapshot.get(pid).ppid; p && snapshot.has(p); p = snapshot.get(p).ppid) {
+      if (opencodePids.has(p)) return false;
+    }
+    return true;
+  });
+  if (opencodeRoots.length) {
+    rootPids.set(OPENCODE_PROCESS_KEY, opencodeRoots.find(pid => / serve\b/.test(snapshot.get(pid).args)) || opencodeRoots[0]);
+    sessionPids.set(OPENCODE_PROCESS_KEY, new Set(opencodeRoots.flatMap(pid => [...bfsDescendants(pid, childrenByPpid)])));
+  }
 
   // Collect all PIDs that need usage info
   const allPids = new Set();
@@ -4299,6 +4757,7 @@ function computeStats(sessions) {
   const monthStartKey = localDateKey(new Date(monthYear, monthMonth, 1));
 
   let totalCpu = 0, totalMemory = 0, totalTools = 0;
+  let sharedCounted = false;
 
   for (const s of sessions) {
     if (s.provider === "claude") totalClaude++;
@@ -4319,7 +4778,8 @@ function computeStats(sessions) {
     totalOutput += s.list_output_tokens || 0;
     totalTools += s.list_tool_count || 0;
 
-    if (s.process) {
+    if (s.process && !(s.process.shared && sharedCounted)) {
+      sharedCounted ||= !!s.process.shared;
       totalCpu += s.process.cpu || 0;
       totalMemory += s.process.memory || 0;
     }
@@ -4882,9 +5342,17 @@ function ageDimColor(session, now) {
   return `\x1b[38;5;${shade}m`;
 }
 
+/** Model ID without the region/vendor prefixes Bedrock and OpenAI-compatible
+ *  gateways put in front of it ("global.anthropic.claude-...", "anthropic/claude-..."). */
+function baseModelName(model) {
+  return model
+    .replace(/^[a-z0-9-]+\//i, "")
+    .replace(/^(?:(?:global|us|eu|apac|jp|au|ca)\.)?(?:anthropic|openai|meta|mistral|amazon|cohere|deepseek|google)\./i, "");
+}
+
 /** Model column color: muted orange for Anthropic, muted blue for OpenAI */
 function modelColor(session) {
-  const m = (session.model || "").toLowerCase();
+  const m = baseModelName(session.model || "").toLowerCase();
   if (m.startsWith("claude")) return "\x1b[38;5;173m"; // muted orange
   if (m.startsWith("gpt") || m.startsWith("o1") || m.startsWith("o3") || m.startsWith("o4")) return "\x1b[38;5;110m"; // muted blue
   return C.dimText;
@@ -5220,7 +5688,7 @@ function renderDetailView(session, data, plan, width, height) {
   const lines = [];
 
   const prov = session.surface === "desktop-cowork" ? "Claude Cowork" : isDesktopSession(session) ? "Claude Code"
-    : session.provider === "claude" ? "Claude" : "Codex";
+    : session.provider === "claude" ? "Claude" : session.provider === "opencode" ? "OpenCode" : "Codex";
   lines.push(boxTop(width - 1, `Session Detail — ${prov} ${session.session_id || "unknown"}`));
   lines.push("");
 
@@ -5277,6 +5745,18 @@ function renderDetailView(session, data, plan, width, height) {
         lines.push(`    ${model}:`);
         lines.push(`      Input: $${p.input_per_million}  Cache write 5m: $${p.cache_write_5m_per_million}  Cache write 1h: $${p.cache_write_1h_per_million}  Cache read: $${p.cache_read_per_million}  Output: $${p.output_per_million}`);
       }
+    } else if (session.provider === "opencode") {
+      lines.push(`  ${BOLD}Total cost: ${C.costYellow}${usd(data.costs.total)}${RESET} (recorded by OpenCode)`);
+      lines.push("");
+      lines.push(`  Model${data.models.length > 1 ? "s" : ""}: ${data.models.join(", ")}`);
+      lines.push(`  Project: ${session.label_source || "unknown"}`);
+      lines.push("");
+      lines.push("  Tokens:");
+      lines.push(`    Input:           ${numberWithCommas(data.tokens.input)}`);
+      lines.push(`    Cache write:     ${numberWithCommas(data.tokens.cache_write)}`);
+      lines.push(`    Cache read:      ${numberWithCommas(data.tokens.cache_read)}`);
+      lines.push(`    Output:          ${numberWithCommas(data.tokens.output)}`);
+      lines.push(`    Total:           ${numberWithCommas(data.tokens.total)}`);
     }
 
     // --- Metrics section ---
@@ -5512,7 +5992,7 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows, scrollTop, st
 
   session._copyTargets = [];
   const prov = session.surface === "desktop-cowork" ? "Claude Cowork" : isDesktopSession(session) ? "Claude Code"
-    : session.provider === "claude" ? "Claude" : "Codex";
+    : session.provider === "claude" ? "Claude" : session.provider === "opencode" ? "OpenCode" : "Codex";
   const sid = session.session_id || "unknown";
   const pm = session.process;
   const now = Date.now();
@@ -5572,23 +6052,27 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows, scrollTop, st
   const provColor = session.surface === "desktop-cowork" ? "\x1b[38;5;183m"  // lavender for cowork
     : isDesktop ? "\x1b[38;5;141m"                                           // purple for code
     : session.provider === "claude" ? "\x1b[38;5;173m"
+    : session.provider === "opencode" ? "\x1b[38;5;180m"
     : "\x1b[38;5;110m";
-  const ml = displayModel.toLowerCase();
+  const ml = baseModelName(displayModel).toLowerCase();
   const mdlColor = ml.startsWith("claude") ? "\x1b[38;5;173m"
     : (ml.startsWith("gpt") || ml.startsWith("o1") || ml.startsWith("o3") || ml.startsWith("o4")) ? "\x1b[38;5;110m"
     : C.hdrValue;
 
-  const fullCmd = (pm && pm.command) || (session.provider === "claude" ? `claude --resume ${session.title || sid}` : `codex resume ${sid}`);
+  const fullCmd = (pm && pm.command && session.provider !== "opencode") ? pm.command
+    : session.provider === "claude" ? `claude --resume ${session.title || sid}`
+    : session.provider === "opencode" ? `opencode --session ${sid}`
+    : `codex resume ${sid}`;
   const title = data.title || session.title;
   const proj = session.label_source || "unknown";
-  const acct = session.provider === "claude" ? readClaudeAccount() : readCodexAccount();
+  const acct = sessionAccount(session);
 
   // Started + durations
   let startedStr = null, apiStr = null, wallStr = null;
   if (session.started_at) {
     const d = parseTimestamp(session.started_at);
     startedStr = d ? d.toLocaleString() : session.started_at;
-    if (session.provider === "claude") {
+    if (session.provider === "claude" || session.provider === "opencode") {
       if (m.api_duration_ms > 0) {
         const apiSec = Math.round(m.api_duration_ms / 1000);
         const apiH = Math.floor(apiSec / 3600);
@@ -5686,9 +6170,9 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows, scrollTop, st
     return dimRule + leftPart + "┴" + rightPart + RESET;
   }
 
-  // ── Lines added/removed (Claude only) ──
+  // ── Lines added/removed (Codex does not record them) ──
   let linesAddedRemoved = false;
-  if (session.provider === "claude" && (m.lines_added > 0 || m.lines_removed > 0)) {
+  if (session.provider !== "codex" && (m.lines_added > 0 || m.lines_removed > 0)) {
     lines.push(fullSep());
     linesAddedRemoved = true;
     const addStr = m.lines_added > 0 ? `${C.hdrLabel}+${RESET}\x1b[38;5;114m${m.lines_added.toLocaleString()}${RESET}` : "";
@@ -5793,6 +6277,8 @@ function renderCostPanel(session, data, plan, panelW, rows, scrollTop, state) {
   leftLines.push(`${C.hdrLabel}Total cost${RESET}  ${totalCostColor}${costVal}${RESET}`);
   if (!incl && isClaude) {
     leftLines.push(`${C.dimText}  (est: tokens × LiteLLM)${RESET}`);
+  } else if (session.provider === "opencode") {
+    leftLines.push(`${C.dimText}  (recorded by OpenCode)${RESET}`);
   }
 
   if (!incl && (data.costsByDay || data.costsByHour)) {
@@ -5855,6 +6341,17 @@ function renderCostPanel(session, data, plan, panelW, rows, scrollTop, state) {
         if (cwTok > 0) {
           rightLines.push(`  ${C.hdrLabel}cache↑${RESET}   ${C.hdrValue}${compactTokens(cwTok).padStart(6)}${RESET}  ${costColor(cwCost)}$${cwCost.toFixed(4)}${RESET}`);
         }
+      }
+    } else if (session.provider === "opencode") {
+      // OpenCode records one cost per turn, so only the model total is priced.
+      for (const mb of data.modelBreakdown || []) {
+        const t = mb.tokens;
+        rightLines.push(dimRule + "─".repeat(30) + RESET);
+        rightLines.push(`${C.hdrValue}${mb.model}${RESET}  ${costColor(mb.total)}$${parseFloat(mb.total).toFixed(2)}${RESET}`);
+        rightLines.push(`  ${C.hdrLabel}in${RESET}       ${C.hdrValue}${compactTokens(t.input).padStart(6)}${RESET}`);
+        rightLines.push(`  ${C.hdrLabel}out${RESET}      ${C.hdrValue}${compactTokens(t.output).padStart(6)}${RESET}`);
+        if (t.cache_read > 0) rightLines.push(`  ${C.hdrLabel}cache↓${RESET}   ${C.hdrValue}${compactTokens(t.cache_read).padStart(6)}${RESET}`);
+        if (t.cache_write > 0) rightLines.push(`  ${C.hdrLabel}cache↑${RESET}   ${C.hdrValue}${compactTokens(t.cache_write).padStart(6)}${RESET}`);
       }
     } else if (!isClaude) {
       // Codex: single model token/cost breakdown
@@ -6772,7 +7269,11 @@ function renderHelpView(width, height) {
 function deleteSession(session) {
   const f = session.data_file;
   if (!f) return;
-  if (session.provider === "claude") {
+  if (session.provider === "opencode") {
+    // The session lives in OpenCode's database; let OpenCode remove it and
+    // its subagent sessions.
+    try { execFileSync("opencode", ["session", "delete", session.session_id], { stdio: "ignore" }); } catch {}
+  } else if (session.provider === "claude") {
     // Remove main transcript
     try { rmSync(f); } catch {}
     // Remove subagent dir (same stem as the .jsonl)
@@ -7213,12 +7714,22 @@ function costAdd(dst, u) {
   if (u.last > dst.last) dst.last = u.last;
 }
 
+const OPENCODE_VENDORS = {
+  anthropic: "Anthropic",
+  openai: "OpenAI",
+  "amazon-bedrock": "AWS Bedrock",
+  google: "Google",
+  "github-copilot": "GitHub Copilot",
+};
+
 function sessionVendor(s) {
+  if (s.provider === "opencode") return OPENCODE_VENDORS[s.vendor] || s.vendor || "Unknown";
   return s.provider === "codex" ? "OpenAI" : "Anthropic";
 }
 
 /** The tool that drove the session (from Claude's entrypoint / Codex's originator). */
 function sessionHarness(s) {
+  if (s.provider === "opencode") return "OpenCode";
   if (s.provider === "codex") {
     const o = s.originator || "";
     if (o === "Codex Desktop") return "Codex Desktop";
@@ -7591,7 +8102,7 @@ function render(state) {
   }
 
   if (state.mode === "detail") {
-    const plan = state.detailSession.provider === "codex" ? state.codexPlan : state.claudePlan;
+    const plan = sessionPlan(state.detailSession, state.codexPlan, state.claudePlan);
     const lines = renderDetailView(state.detailSession, state.detailData, plan, width - 1, height);
     for (const line of lines) buf += ansiSlice(line, 0, width - 1) + "\x1b[K\n";
     buf += ansiSlice(renderFooter(state, width - 1), 0, width - 1);
@@ -7673,7 +8184,7 @@ function render(state) {
   // Bottom detail panels (tabbed) — for subagent rows we synthesize a session-like
   // object so the existing panel renderers can consume the subagent's own data.
   const selected = getSelectedPanelSession(state);
-  const panelPlan = selected ? (selected.provider === "codex" ? state.codexPlan : state.claudePlan) : null;
+  const panelPlan = selected ? sessionPlan(selected, state.codexPlan, state.claudePlan) : null;
   state._tabBarRow = screenLines.length + 1; // 1-based row of the tab bar
   state._configPanelTop = screenLines.length + 3; // 1-based: tab bar + rule line → first content row
   const bottomLines = renderBottomPanels(selected, state.panelData, panelPlan, boxW, panelHeight, resolveActiveTab(state, state.panelData), state.hoverTab, state);
@@ -8998,7 +9509,7 @@ function formatSessionLine(index, session, label, width) {
   return clipLine(line, width);
 }
 
-function renderGroupedLines(codexSessions, claudeSessions, codexPlan, claudePlan) {
+function renderGroupedLines(codexSessions, claudeSessions, opencodeSessions, codexPlan, claudePlan) {
   const width = displayWidth();
   let label = "cost";
   if (
@@ -9008,36 +9519,20 @@ function renderGroupedLines(codexSessions, claudeSessions, codexPlan, claudePlan
     label = "est";
 
   const lines = [];
-  lines.push("Codex:");
-  if (!codexSessions.length) {
-    lines.push("  (none)");
-  } else {
-    lines.push(
-      `    start  last     in    out      ${label.padStart(5)}  session                        model`
-    );
-    const labels = abbreviatePaths(codexSessions.map((s) => s.label_source));
-    for (let i = 0; i < codexSessions.length; i++) {
-      const label = codexSessions[i].title || labels[i];
-      lines.push(formatSessionLine(i + 1, codexSessions[i], label, width));
+  let index = 0;
+  for (const [heading, sessions] of [["Codex:", codexSessions], ["Claude:", claudeSessions], ["OpenCode:", opencodeSessions]]) {
+    if (lines.length) lines.push("");
+    lines.push(heading);
+    if (!sessions.length) {
+      lines.push("  (none)");
+      continue;
     }
-  }
-  lines.push("");
-  lines.push("Claude:");
-  if (!claudeSessions.length) {
-    lines.push("  (none)");
-  } else {
     lines.push(
       `    start  last     in    out      ${label.padStart(5)}  session                        model`
     );
-    const labels = abbreviatePaths(claudeSessions.map((s) => s.label_source));
-    for (let i = 0; i < claudeSessions.length; i++) {
-      const label = claudeSessions[i].title || labels[i];
-      lines.push(formatSessionLine(
-        codexSessions.length + i + 1,
-        claudeSessions[i],
-        label,
-        width
-      ));
+    const labels = abbreviatePaths(sessions.map((s) => s.label_source));
+    for (let i = 0; i < sessions.length; i++) {
+      lines.push(formatSessionLine(++index, sessions[i], sessions[i].title || labels[i], width));
     }
   }
   return lines;
@@ -9114,11 +9609,12 @@ function pruneSessionCaches(sessions, contextCache) {
 }
 
 async function loadSessions(state) {
-  const [codexSessions, claudeSessions] = listAllSessions();
+  const [codexSessions, claudeSessions, opencodeSessions] = listAllSessions();
   applyCurrentDirectoryOverride(codexSessions);
   await annotateListCosts(codexSessions, state.codexPlan);
   await annotateListCosts(claudeSessions, state.claudePlan);
-  state.sessions = [...codexSessions, ...claudeSessions];
+  await annotateListCosts(opencodeSessions, "retail");
+  state.sessions = [...codexSessions, ...claudeSessions, ...opencodeSessions];
 
   // Quota: fetch provider usage limits periodically
   state._quotaTick = (state._quotaTick || 0) + 1;
@@ -9150,6 +9646,20 @@ async function loadSessions(state) {
       // regardless of which panel is currently visible.
       pushHistory(_cpuHistory, key, pm.cpu);
       pushHistory(_memHistory, key, pm.memory / (1024 * 1024));
+    } else if (s.provider === "opencode") {
+      const server = state._processMetrics.get(OPENCODE_PROCESS_KEY);
+      const recent = Date.now() - new Date(s.last_active).getTime() < 90_000;
+      // 1.x databases have no idle marker, so recent activity is all there is.
+      // Without a visible opencode process (Windows, or an unrecognised
+      // launcher) fall back to the same sentinel as Cowork.
+      const running = s._busy ?? recent;
+      s.process = running && server ? { ...server, shared: true }
+        : running && recent ? { cpu: 0, memory: 0, pids: 0, command: "(opencode)", processList: [] }
+        : null;
+      if (s.process && server) {
+        pushHistory(_cpuHistory, key, server.cpu);
+        pushHistory(_memHistory, key, server.memory / (1024 * 1024));
+      }
     } else if (s.surface === "desktop-cowork") {
       // Cowork runs in a VM — no local process, but we can infer "running"
       // from last_active being very recent. Use a minimal sentinel so the
@@ -9163,6 +9673,7 @@ async function loadSessions(state) {
       s.process = null;
     }
   }
+  matchedKeys.add(OPENCODE_PROCESS_KEY);
 
   // Create virtual sessions for running processes with no transcript match
   for (const [key, pm] of state._processMetrics) {
@@ -9252,14 +9763,15 @@ async function main() {
         return 1;
       }
       const [codexPlan, claudePlan] = plans;
-      const [codexSessions, claudeSessions] = listAllSessions();
+      const [codexSessions, claudeSessions, opencodeSessions] = listAllSessions();
       applyCurrentDirectoryOverride(codexSessions);
       await annotateListCosts(codexSessions, codexPlan);
       await annotateListCosts(claudeSessions, claudePlan);
-      const allSessions = [...codexSessions, ...claudeSessions];
+      await annotateListCosts(opencodeSessions, "retail");
+      const allSessions = [...codexSessions, ...claudeSessions, ...opencodeSessions];
 
       if (args.listSessions) {
-        for (const line of renderGroupedLines(codexSessions, claudeSessions, codexPlan, claudePlan))
+        for (const line of renderGroupedLines(codexSessions, claudeSessions, opencodeSessions, codexPlan, claudePlan))
           console.log(line);
         saveDiskCache();
         return 0;
@@ -9269,9 +9781,9 @@ async function main() {
         const jsonSessions = await Promise.all(allSessions.map(async (s) => {
           const data = await safeExtractSessionData(s);
           const m = safeMetrics(data);
-          const plan = s.provider === "codex" ? codexPlan : claudePlan;
+          const plan = sessionPlan(s, codexPlan, claudePlan);
           const incl = planIncludesProvider(plan, s.provider);
-          const acct = s.provider === "claude" ? readClaudeAccount() : readCodexAccount();
+          const acct = sessionAccount(s);
           const obj = {
             provider: s.provider,
             surface: s.surface || null,
